@@ -9,6 +9,7 @@ Design goals:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -28,6 +29,7 @@ class _JwksCache:
 
 
 _JWKS_CACHE: Optional[_JwksCache] = None
+_JWKS_LOCK = threading.Lock()
 _JWKS_TTL_SECONDS = 60 * 60  # 1 hour
 
 
@@ -47,12 +49,24 @@ def _fetch_jwks(jwks_url: str) -> Dict[str, Dict[str, Any]]:
 def _get_jwks_by_kid(jwks_url: str) -> Dict[str, Dict[str, Any]]:
     global _JWKS_CACHE
     now = time.time()
-    if _JWKS_CACHE and (now - _JWKS_CACHE.fetched_at) < _JWKS_TTL_SECONDS:
-        return _JWKS_CACHE.keys
+    # Fast path: read a snapshot of the cache without holding the lock.
+    # Object reference reads are atomic in CPython (GIL), so this is safe.
+    snapshot = _JWKS_CACHE
+    if snapshot and (now - snapshot.fetched_at) < _JWKS_TTL_SECONDS:
+        return snapshot.keys
 
-    keys = _fetch_jwks(jwks_url)
-    _JWKS_CACHE = _JwksCache(keys=keys, fetched_at=now)
-    return keys
+    # Slow path: fetch new keys *outside* the lock to avoid blocking other threads
+    # during the network call, then atomically replace the cache.
+    new_keys = _fetch_jwks(jwks_url)
+    fetched_at = time.time()
+    new_cache = _JwksCache(keys=new_keys, fetched_at=fetched_at)
+    with _JWKS_LOCK:
+        # Double-check: only replace if cache is still stale (another thread may
+        # have refreshed it while we were fetching).
+        current = _JWKS_CACHE
+        if not current or (time.time() - current.fetched_at) >= _JWKS_TTL_SECONDS:
+            _JWKS_CACHE = new_cache
+    return new_keys
 
 
 def _get_expected_issuer(supabase_url: str) -> str:
@@ -92,8 +106,9 @@ def verify_supabase_access_token(token: str) -> Optional[Dict[str, Any]]:
         jwk_data = jwks_by_kid.get(str(kid))
         if not jwk_data:
             # Key rotation: refresh once before giving up.
-            global _JWKS_CACHE
-            _JWKS_CACHE = None
+            with _JWKS_LOCK:
+                global _JWKS_CACHE
+                _JWKS_CACHE = None
             jwks_by_kid = _get_jwks_by_kid(jwks_url)
             jwk_data = jwks_by_kid.get(str(kid))
             if not jwk_data:
